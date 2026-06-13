@@ -277,7 +277,7 @@ client.on('interactionCreate', async (interaction) => {
         .replace(/[^a-z0-9가-힣]/g, '')
         .slice(0, 12) || 'user';
 
-    const channelName = `${option.value.toLowerCase()}-${safeName}`;
+    const channelName = `${option.channelPrefix || option.value.toLowerCase()}-${safeName}`;
     const ticketNum = String(ticketCounter).padStart(4, '0');
 
     const STAFF_ALLOW = [
