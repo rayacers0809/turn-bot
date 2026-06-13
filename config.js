@@ -5,21 +5,17 @@ module.exports = {
   PUBLIC_KEY:              process.env.PUBLIC_KEY,
   GUILD_ID:                process.env.GUILD_ID,
   PANEL_GUILD_ID:          process.env.PANEL_GUILD_ID || process.env.GUILD_ID,
-
   TICKET_PANEL_CHANNEL_ID: process.env.TICKET_PANEL_CHANNEL_ID,
   LOG_CHANNEL_ID:          process.env.LOG_CHANNEL_ID,
   STAFF_ROLE_ID:           process.env.STAFF_ROLE_ID,
   STAFF_ROLE_ID2:          process.env.STAFF_ROLE_ID2,
   STAFF_ROLE_ID3:          process.env.STAFF_ROLE_ID3,
-
   CATEGORIES: {
     GENERAL: process.env.CATEGORY_GENERAL,
     FACTION: process.env.CATEGORY_FACTION,
     SUPPORT: process.env.CATEGORY_SUPPORT,
   },
-
   WEB_BASE_URL: process.env.WEB_BASE_URL,
-
   TICKET_OPTIONS: [
     {
       label: '일반 문의',
@@ -27,6 +23,7 @@ module.exports = {
       value: 'GENERAL',
       emoji: '',
       categoryKey: 'GENERAL',
+      channelPrefix: '일반문의',
     },
     {
       label: '팩션창설 문의',
@@ -34,6 +31,7 @@ module.exports = {
       value: 'FACTION',
       emoji: '',
       categoryKey: 'FACTION',
+      channelPrefix: '팩션창설문의',
     },
     {
       label: '후원 문의',
@@ -41,6 +39,7 @@ module.exports = {
       value: 'SUPPORT',
       emoji: '',
       categoryKey: 'SUPPORT',
+      channelPrefix: '후원문의',
     },
   ],
 };
