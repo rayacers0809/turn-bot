@@ -528,18 +528,11 @@ client.on('messageCreate', async (message) => {
     const ticketChannel = guild.channels.cache.get(ticketInfo.channelId);
     if (!ticketChannel) return;
 
-    const relayEmbed = new EmbedBuilder()
-      .setColor(0x6366f1)
-      .setAuthor({
-        name: `${message.author.tag} (유저)`,
-        iconURL: message.author.displayAvatarURL({ size: 64 }),
-      })
-      .setDescription(message.content || '(첨부파일)')
-      .setTimestamp();
-
     const files = message.attachments.map(a => a.url);
-
-    await ticketChannel.send({ embeds: [relayEmbed], files });
+    const lines = (message.content || '').split('\n').map(line =>
+      `<@${message.author.id}>(${message.author.id}) : ${line}`
+    ).join('\n');
+    await ticketChannel.send({ content: lines || undefined, files });
     await message.react('✅').catch(() => {});
 
     try {
@@ -729,18 +722,11 @@ client.on('messageCreate', async (message) => {
         a => new AttachmentBuilder(a.url, { name: a.name })
       );
 
+      const staffLines = (message.content || '').split('\n').map(line =>
+        `[관리자] ${message.member.displayName}: ${line}`
+      ).join('\n');
       await user.send({
-        embeds: [
-          new EmbedBuilder()
-            .setColor(0xa78bfa)
-            .setAuthor({
-              name: 'Turn 고객센터',
-              iconURL: client.user.displayAvatarURL(),
-            })
-            .setDescription(message.content || '(첨부파일)')
-            .setFooter({ text: 'Turn • 이 메시지에 답장하면 스탭에게 전달됩니다' })
-            .setTimestamp(),
-        ],
+        content: staffLines || undefined,
         files: fileAttachments.length > 0 ? fileAttachments : [],
       });
 
