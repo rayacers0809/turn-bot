@@ -34,6 +34,19 @@ let ticketCounter = 0;
 const dmMap = new Map();
 const closingSet = new Set(); // 중복 종료 방지
 
+// 유효한 스탭 역할 ID만 추림 (빈값/잘못된값/@everyone=서버ID 자동 제외)
+function validStaffRoleIds() {
+  return [...new Set(
+    [config.STAFF_ROLE_ID, config.STAFF_ROLE_ID2, config.STAFF_ROLE_ID3]
+      .filter(id =>
+        typeof id === 'string' &&
+        /^\d{17,20}$/.test(id) &&
+        id !== config.GUILD_ID &&
+        id !== config.PANEL_GUILD_ID
+      )
+  )];
+}
+
 async function getSetting(key) {
   try {
     const doc = await getDb().collection('settings').doc(key).get();
@@ -256,55 +269,38 @@ client.on('interactionCreate', async (interaction) => {
     const channelName = `${option.value.toLowerCase()}-${safeName}`;
     const ticketNum = String(ticketCounter).padStart(4, '0');
 
+    const STAFF_ALLOW = [
+      PermissionsBitField.Flags.ViewChannel,
+      PermissionsBitField.Flags.SendMessages,
+      PermissionsBitField.Flags.ReadMessageHistory,
+      PermissionsBitField.Flags.AttachFiles,
+      PermissionsBitField.Flags.ManageMessages,
+    ];
+
+    const staffIds = validStaffRoleIds();
+    if (staffIds.length === 0) {
+      console.warn('⚠️ 유효한 STAFF_ROLE_ID가 없습니다. 스탭이 티켓 채널을 못 볼 수 있어요.');
+    }
+
+    const permissionOverwrites = [
+      { id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
+      ...staffIds.map(id => ({ id, allow: STAFF_ALLOW })),
+      {
+        id: client.user.id,
+        allow: [
+          PermissionsBitField.Flags.ViewChannel,
+          PermissionsBitField.Flags.SendMessages,
+          PermissionsBitField.Flags.ReadMessageHistory,
+        ],
+      },
+    ];
+
     const ticketChannel = await guild.channels.create({
       name: channelName,
       type: ChannelType.GuildText,
       parent: categoryId,
       topic: `ticketId:${ticketId} | userId:${member.id} | type:${option.value}`,
-      permissionOverwrites: [
-        {
-          id: guild.roles.everyone.id,
-          deny: [PermissionsBitField.Flags.ViewChannel],
-        },
-        {
-          id: config.STAFF_ROLE_ID,
-          allow: [
-            PermissionsBitField.Flags.ViewChannel,
-            PermissionsBitField.Flags.SendMessages,
-            PermissionsBitField.Flags.ReadMessageHistory,
-            PermissionsBitField.Flags.AttachFiles,
-            PermissionsBitField.Flags.ManageMessages,
-          ],
-        },
-        {
-          id: config.STAFF_ROLE_ID2,
-          allow: [
-            PermissionsBitField.Flags.ViewChannel,
-            PermissionsBitField.Flags.SendMessages,
-            PermissionsBitField.Flags.ReadMessageHistory,
-            PermissionsBitField.Flags.AttachFiles,
-            PermissionsBitField.Flags.ManageMessages,
-          ],
-        },
-        {
-          id: config.STAFF_ROLE_ID3,
-          allow: [
-            PermissionsBitField.Flags.ViewChannel,
-            PermissionsBitField.Flags.SendMessages,
-            PermissionsBitField.Flags.ReadMessageHistory,
-            PermissionsBitField.Flags.AttachFiles,
-            PermissionsBitField.Flags.ManageMessages,
-          ],
-        },
-        {
-          id: client.user.id,
-          allow: [
-            PermissionsBitField.Flags.ViewChannel,
-            PermissionsBitField.Flags.SendMessages,
-            PermissionsBitField.Flags.ReadMessageHistory,
-          ],
-        },
-      ],
+      permissionOverwrites,
     });
 
     dmMap.set(member.id, {
@@ -551,11 +547,8 @@ client.on('messageCreate', async (message) => {
 
     if (!channel.topic || !channel.topic.includes('ticketId:')) return;
 
-    const isStaff = (
-      message.member?.roles.cache.has(config.STAFF_ROLE_ID) ||
-      message.member?.roles.cache.has(config.STAFF_ROLE_ID2) ||
-      message.member?.roles.cache.has(config.STAFF_ROLE_ID3)
-    );
+    const staffIds = validStaffRoleIds();
+    const isStaff = staffIds.some(id => message.member?.roles.cache.has(id));
 
     if (!isStaff) return;
 
