@@ -570,7 +570,10 @@ client.on('messageCreate', async (message) => {
     if (!channel.topic || !channel.topic.includes('ticketId:')) return;
 
     const staffIds = validStaffRoleIds();
-    const isStaff = staffEveryoneMode() || staffIds.some(id => message.member?.roles.cache.has(id));
+    const isStaff =
+      staffEveryoneMode() ||
+      message.member?.permissions?.has(PermissionsBitField.Flags.Administrator) ||
+      staffIds.some(id => message.member?.roles.cache.has(id));
 
     if (!isStaff) return;
 
