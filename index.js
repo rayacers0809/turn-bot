@@ -47,6 +47,17 @@ function validStaffRoleIds() {
   )];
 }
 
+// STAFF_ROLE_ID 슬롯에 'everyone' / '@everyone' / 고객센터 서버ID 를 넣으면
+// → 고객센터 서버 전원에게 티켓 공개 (스탭 역할 없이 운영)
+function staffEveryoneMode() {
+  return [config.STAFF_ROLE_ID, config.STAFF_ROLE_ID2, config.STAFF_ROLE_ID3]
+    .some(v => typeof v === 'string' && (
+      v.trim().toLowerCase() === 'everyone' ||
+      v.trim() === '@everyone' ||
+      v.trim() === config.GUILD_ID
+    ));
+}
+
 async function getSetting(key) {
   try {
     const doc = await getDb().collection('settings').doc(key).get();
@@ -277,13 +288,24 @@ client.on('interactionCreate', async (interaction) => {
       PermissionsBitField.Flags.ManageMessages,
     ];
 
-    const staffIds = validStaffRoleIds();
-    if (staffIds.length === 0) {
-      console.warn('⚠️ 유효한 STAFF_ROLE_ID가 없습니다. 스탭이 티켓 채널을 못 볼 수 있어요.');
+    const configuredStaff = validStaffRoleIds();
+    const staffIds = configuredStaff.filter(id => guild.roles.cache.has(id));
+    const missingStaff = configuredStaff.filter(id => !guild.roles.cache.has(id));
+    const everyoneMode = staffEveryoneMode();
+    if (missingStaff.length) {
+      console.warn(`⚠️ 고객센터 서버(${guild.name})에 없는 역할 ID 무시: ${missingStaff.join(', ')}`);
+    }
+    if (!everyoneMode && staffIds.length === 0) {
+      console.warn('⚠️ 유효한 스탭 설정이 없습니다. STAFF_ROLE_ID에 고객센터 서버 역할 ID를 넣거나 "everyone"으로 설정하세요.');
     }
 
+    // everyoneMode면 @everyone 에게 열어주고, 아니면 막고 스탭 역할에만 허용
+    const everyoneOverwrite = everyoneMode
+      ? { id: guild.roles.everyone.id, allow: STAFF_ALLOW }
+      : { id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] };
+
     const permissionOverwrites = [
-      { id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
+      everyoneOverwrite,
       ...staffIds.map(id => ({ id, allow: STAFF_ALLOW })),
       {
         id: client.user.id,
@@ -548,7 +570,7 @@ client.on('messageCreate', async (message) => {
     if (!channel.topic || !channel.topic.includes('ticketId:')) return;
 
     const staffIds = validStaffRoleIds();
-    const isStaff = staffIds.some(id => message.member?.roles.cache.has(id));
+    const isStaff = staffEveryoneMode() || staffIds.some(id => message.member?.roles.cache.has(id));
 
     if (!isStaff) return;
 
