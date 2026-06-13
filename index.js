@@ -406,24 +406,30 @@ async function sendStaffGuide(ticketChannel, member, option, ticketNum, ticketId
     const db = getDb();
     const snap = await db.collection('tickets')
       .where('userId', '==', member.id)
-      .where('status', '==', 'closed')
-      .orderBy('closedAt', 'desc')
-      .limit(4)
       .get();
 
     if (!snap.empty) {
-      recentList = snap.docs.map(doc => {
-        const d = doc.data();
-        const date = new Date(d.closedAt);
-        const label =
-          `${String(date.getFullYear()).slice(2)}년 ` +
-          `${String(date.getMonth() + 1).padStart(2, '0')}월 ` +
-          `${String(date.getDate()).padStart(2, '0')}일 문의내역`;
+      const closed = snap.docs
+        .map(doc => doc.data())
+        .filter(d => d.status === 'closed' && d.closedAt)
+        .sort((a, b) => new Date(b.closedAt) - new Date(a.closedAt))
+        .slice(0, 4);
 
-        return `[${label}](${config.WEB_BASE_URL}ticket/${d.ticketId})`;
-      }).join('\n');
+      if (closed.length) {
+        recentList = closed.map(d => {
+          const date = new Date(d.closedAt);
+          const label =
+            `${String(date.getFullYear()).slice(2)}년 ` +
+            `${String(date.getMonth() + 1).padStart(2, '0')}월 ` +
+            `${String(date.getDate()).padStart(2, '0')}일 문의내역`;
+
+          return `[${label}](${config.WEB_BASE_URL}ticket/${d.ticketId})`;
+        }).join('\n');
+      }
     }
-  } catch {}
+  } catch (e) {
+    console.error('최근 문의 내역 조회 실패:', e.message);
+  }
 
   const guideEmbed = new EmbedBuilder()
     .setColor(0x7c3aed)
