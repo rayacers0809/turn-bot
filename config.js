@@ -34,12 +34,12 @@ module.exports = {
       channelPrefix: '팩션창설문의',
     },
     {
-      label: '후원 문의',
-      description: '후원 상품 문의 및 개인 상품 신청은 이 티켓을 이용해 주세요',
+      label: '결제 문의',
+      description: '결제 상품 문의 및 개인 상품 신청은 이 티켓을 이용해 주세요',
       value: 'SUPPORT',
       emoji: '',
       categoryKey: 'SUPPORT',
-      channelPrefix: '후원문의',
+      channelPrefix: '결제문의',
     },
   ],
 };
