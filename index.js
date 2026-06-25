@@ -1,6 +1,8 @@
 const {
   Client,
   GatewayIntentBits,
+  Partials,
+  MessageFlags,
   EmbedBuilder,
   ActionRowBuilder,
   StringSelectMenuBuilder,
@@ -25,14 +27,23 @@ const client = new Client({
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.DirectMessages,
   ],
-  partials: ['CHANNEL', 'MESSAGE'],
+  // v14: 문자열 'CHANNEL' 같은 거 넣으면 조용히 무시됨 → Partials enum 필수
+  partials: [Partials.Channel, Partials.Message],
 });
 
 initFirebase();
 
 let ticketCounter = 0;
 const dmMap = new Map();
-const closingSet = new Set(); // 중복 종료 방지
+const closingSet = new Set();   // 중복 종료 방지
+const creatingSet = new Set();  // 버튼 연타로 인한 중복 티켓 생성 방지
+
+// 알려진 스탭 명령어 (이외의 .명령어는 유저에게 릴레이하지 않음)
+const KNOWN_DOT_COMMANDS = ['.문의종료', '.강제종료', '.느린문의', '.단팩신청서'];
+
+// ─────────────────────────────────────────────
+// 유틸
+// ─────────────────────────────────────────────
 
 // 유효한 스탭 역할 ID만 추림 (빈값/잘못된값/@everyone=서버ID 자동 제외)
 function validStaffRoleIds() {
@@ -58,6 +69,48 @@ function staffEveryoneMode() {
     ));
 }
 
+// 스탭 멘션 문자열 (everyone 모드거나 잘못된 ID면 @here 로 대체)
+function staffMention() {
+  const ids = validStaffRoleIds();
+  if (staffEveryoneMode() || ids.length === 0) return '@here';
+  return ids.map(id => `<@&${id}>`).join(' ');
+}
+
+// 2000자 제한 대응: 줄 단위로 안전 분할
+function chunkContent(str, size = 1900) {
+  const chunks = [];
+  let cur = '';
+  for (const line of String(str).split('\n')) {
+    if ((cur + line + '\n').length > size) {
+      if (cur) { chunks.push(cur); cur = ''; }
+      if (line.length > size) {
+        for (let i = 0; i < line.length; i += size) chunks.push(line.slice(i, i + size));
+      } else {
+        cur = line + '\n';
+      }
+    } else {
+      cur += line + '\n';
+    }
+  }
+  if (cur) chunks.push(cur);
+  return chunks.length ? chunks : [''];
+}
+
+// content(긴 텍스트) + files 안전 전송. 파일은 마지막 청크에 첨부.
+async function sendChunked(target, content, files = []) {
+  const text = (content || '').trim();
+  const chunks = text ? chunkContent(text) : [''];
+
+  for (let i = 0; i < chunks.length; i++) {
+    const isLast = i === chunks.length - 1;
+    const payload = {};
+    if (chunks[i]) payload.content = chunks[i];
+    if (isLast && files.length) payload.files = files;
+    if (!payload.content && !payload.files) continue;
+    await target.send(payload);
+  }
+}
+
 async function getSetting(key) {
   try {
     const doc = await getDb().collection('settings').doc(key).get();
@@ -70,6 +123,9 @@ async function setSetting(key, value) {
   await getDb().collection('settings').doc(key).set({ value });
 }
 
+// ─────────────────────────────────────────────
+// 슬래시 커맨드 등록
+// ─────────────────────────────────────────────
 async function registerCommands() {
   const commands = [
     new SlashCommandBuilder()
@@ -111,9 +167,60 @@ async function registerCommands() {
   }
 }
 
+// ─────────────────────────────────────────────
+// dmMap 복원 (봇 재시작 시 진행중 티켓 매핑 복구)
+// ─────────────────────────────────────────────
+async function restoreOpenTickets() {
+  try {
+    const guild = client.guilds.cache.get(config.GUILD_ID);
+    const snap = await getDb().collection('tickets')
+      .where('status', '==', 'open')
+      .get();
+
+    let restored = 0;
+    let stale = 0;
+
+    for (const doc of snap.docs) {
+      const d = doc.data();
+      if (!d.userId || !d.channelId) continue;
+
+      // 채널이 이미 삭제됐는데 status가 open인 경우 → 정리
+      const channelExists = guild?.channels.cache.has(d.channelId);
+      if (!channelExists) {
+        stale++;
+        try {
+          await getDb().collection('tickets').doc(d.ticketId).update({
+            status: 'closed',
+            closedAt: d.closedAt || new Date().toISOString(),
+            closedBy: 'system(restart-cleanup)',
+            closeType: 'stale',
+          });
+        } catch {}
+        continue;
+      }
+
+      dmMap.set(d.userId, {
+        ticketId: d.ticketId,
+        channelId: d.channelId,
+        type: d.type,
+        typeLabel: d.typeLabel,
+      });
+      restored++;
+    }
+
+    console.log(`🔄 진행중 티켓 복원: ${restored}건 (정리된 stale: ${stale}건)`);
+  } catch (e) {
+    console.error('티켓 복원 실패:', e.message);
+  }
+}
+
+// ─────────────────────────────────────────────
+// Ready
+// ─────────────────────────────────────────────
 client.once('clientReady', async () => {
   console.log(`✅ ${client.user.tag} 온라인`);
   await registerCommands();
+
   try {
     const db = getDb();
     const metaDoc = await db.collection('meta').doc('counter').get();
@@ -124,14 +231,19 @@ client.once('clientReady', async () => {
   } catch (e) {
     console.error('카운터 복원 실패:', e.message);
   }
+
+  await restoreOpenTickets();
 });
 
+// ─────────────────────────────────────────────
+// 인터랙션
+// ─────────────────────────────────────────────
 client.on('interactionCreate', async (interaction) => {
 
   // ── /panel ──
   if (interaction.isChatInputCommand() && interaction.commandName === 'panel') {
-    if (!interaction.memberPermissions.has(PermissionsBitField.Flags.Administrator)) {
-      return interaction.reply({ content: '❌ 관리자만 사용 가능합니다.', ephemeral: true });
+    if (!interaction.memberPermissions?.has(PermissionsBitField.Flags.Administrator)) {
+      return interaction.reply({ content: '❌ 관리자만 사용 가능합니다.', flags: MessageFlags.Ephemeral });
     }
 
     const embed = new EmbedBuilder()
@@ -162,21 +274,21 @@ client.on('interactionCreate', async (interaction) => {
     if (!targetChannel) {
       return interaction.reply({
         content: '❌ PANEL_GUILD_ID / TICKET_PANEL_CHANNEL_ID를 확인해주세요. (봇이 본섭에 들어가 있어야 함)',
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
     await targetChannel.send({ embeds: [embed], components: [row] });
     return interaction.reply({
       content: `✅ ${targetChannel} 에 패널 전송 완료!`,
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
   // ── /설정 ──
   if (interaction.isChatInputCommand() && interaction.commandName === '설정') {
-    if (!interaction.memberPermissions.has(PermissionsBitField.Flags.Administrator)) {
-      return interaction.reply({ content: '❌ 관리자만 사용 가능합니다.', ephemeral: true });
+    if (!interaction.memberPermissions?.has(PermissionsBitField.Flags.Administrator)) {
+      return interaction.reply({ content: '❌ 관리자만 사용 가능합니다.', flags: MessageFlags.Ephemeral });
     }
 
     const 항목 = interaction.options.getString('항목');
@@ -195,14 +307,14 @@ client.on('interactionCreate', async (interaction) => {
           )
           .setTimestamp(),
       ],
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
   // ── /설정확인 ──
   if (interaction.isChatInputCommand() && interaction.commandName === '설정확인') {
-    if (!interaction.memberPermissions.has(PermissionsBitField.Flags.Administrator)) {
-      return interaction.reply({ content: '❌ 관리자만 사용 가능합니다.', ephemeral: true });
+    if (!interaction.memberPermissions?.has(PermissionsBitField.Flags.Administrator)) {
+      return interaction.reply({ content: '❌ 관리자만 사용 가능합니다.', flags: MessageFlags.Ephemeral });
     }
 
     const [신청서, 느린] = await Promise.all([
@@ -221,13 +333,13 @@ client.on('interactionCreate', async (interaction) => {
           )
           .setTimestamp(),
       ],
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
   // ── 티켓 버튼 ──
   if (interaction.isButton() && interaction.customId.startsWith('ticket_btn:')) {
-    await interaction.deferReply({ flags: 64 });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     const selectedValue = interaction.customId.split(':')[1];
     const option = config.TICKET_OPTIONS.find(o => o.value === selectedValue);
@@ -244,6 +356,11 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.editReply({ content: '❌ 고객센터 서버(GUILD_ID)를 찾을 수 없습니다. 봇이 해당 서버에 들어가 있는지 확인해주세요.' });
     }
 
+    // 연타 방지 가드 (생성 중인 유저는 즉시 차단)
+    if (creatingSet.has(member.id)) {
+      return interaction.editReply({ content: '⏳ 티켓을 생성하는 중입니다. 잠시만 기다려주세요.' });
+    }
+
     const categoryId = config.CATEGORIES[option.categoryKey];
     const category = guild.channels.cache.get(categoryId);
 
@@ -256,143 +373,157 @@ client.on('interactionCreate', async (interaction) => {
     if (dmMap.has(member.id)) {
       const existing = dmMap.get(member.id);
       const existingCh = guild.channels.cache.get(existing.channelId);
+      // 매핑은 있는데 채널이 사라졌으면 매핑 정리 후 진행
+      if (!existingCh) {
+        dmMap.delete(member.id);
+      } else {
+        return interaction.editReply({
+          content: `❌ 이미 진행중인 문의가 있습니다. (${existingCh})`,
+        });
+      }
+    }
+
+    creatingSet.add(member.id);
+
+    try {
+      ticketCounter++;
+      const ticketId = uuidv4();
+
+      try {
+        await getDb().collection('meta').doc('counter').set({ value: ticketCounter });
+      } catch (e) {
+        console.error('카운터 저장 실패:', e);
+      }
+
+      const safeName =
+        member.user.username
+          .toLowerCase()
+          .replace(/[^a-z0-9가-힣]/g, '')
+          .slice(0, 12) || 'user';
+
+      const channelName = `${option.channelPrefix || option.value.toLowerCase()}-${safeName}`;
+      const ticketNum = String(ticketCounter).padStart(4, '0');
+
+      const STAFF_ALLOW = [
+        PermissionsBitField.Flags.ViewChannel,
+        PermissionsBitField.Flags.SendMessages,
+        PermissionsBitField.Flags.ReadMessageHistory,
+        PermissionsBitField.Flags.AttachFiles,
+        PermissionsBitField.Flags.ManageMessages,
+      ];
+
+      const configuredStaff = validStaffRoleIds();
+      const staffIds = configuredStaff.filter(id => guild.roles.cache.has(id));
+      const missingStaff = configuredStaff.filter(id => !guild.roles.cache.has(id));
+      const everyoneMode = staffEveryoneMode();
+      if (missingStaff.length) {
+        console.warn(`⚠️ 고객센터 서버(${guild.name})에 없는 역할 ID 무시: ${missingStaff.join(', ')}`);
+      }
+      if (!everyoneMode && staffIds.length === 0) {
+        console.warn('⚠️ 유효한 스탭 설정이 없습니다. STAFF_ROLE_ID에 고객센터 서버 역할 ID를 넣거나 "everyone"으로 설정하세요.');
+      }
+
+      // everyoneMode면 @everyone 에게 열어주고, 아니면 막고 스탭 역할에만 허용
+      const everyoneOverwrite = everyoneMode
+        ? { id: guild.roles.everyone.id, allow: STAFF_ALLOW }
+        : { id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] };
+
+      const permissionOverwrites = [
+        everyoneOverwrite,
+        ...staffIds.map(id => ({ id, allow: STAFF_ALLOW })),
+        {
+          id: client.user.id,
+          allow: [
+            PermissionsBitField.Flags.ViewChannel,
+            PermissionsBitField.Flags.SendMessages,
+            PermissionsBitField.Flags.ReadMessageHistory,
+            PermissionsBitField.Flags.ManageChannels,
+          ],
+        },
+      ];
+
+      const ticketChannel = await guild.channels.create({
+        name: channelName,
+        type: ChannelType.GuildText,
+        parent: categoryId,
+        topic: `ticketId:${ticketId} | userId:${member.id} | type:${option.value}`,
+        permissionOverwrites,
+      });
+
+      dmMap.set(member.id, {
+        ticketId,
+        channelId: ticketChannel.id,
+        type: option.value,
+        typeLabel: option.label,
+      });
+
+      const ticketData = {
+        ticketId,
+        ticketNumber: ticketCounter,
+        channelId: ticketChannel.id,
+        channelName,
+        type: option.value,
+        typeLabel: option.label,
+        userId: member.id,
+        userTag: member.user.tag,
+        userDisplayName: member.displayName,
+        guildId: guild.id,
+        guildName: guild.name,
+        status: 'open',
+        createdAt: new Date().toISOString(),
+        closedAt: null,
+        closedBy: null,
+        messages: [],
+      };
+
+      try {
+        await getDb().collection('tickets').doc(ticketId).set(ticketData);
+      } catch (e) {
+        console.error('티켓 생성 Firestore 저장 실패:', e);
+      }
+
+      await sendStaffGuide(ticketChannel, member, option, ticketNum, ticketId);
+
+      try {
+        const dmEmbed = new EmbedBuilder()
+          .setColor(0x7c3aed)
+          .setTitle(`${option.emoji ? option.emoji + ' ' : ''}${option.label} 문의 접수`)
+          .setDescription(
+            `안녕하세요 **${member.displayName}**님!\n\n` +
+            `**[${option.label}]** 문의가 접수되었습니다 🩷\n\n` +
+            `아래에 문의하실 내용을 입력해주세요.\n` +
+            `스탭이 확인 후 이 DM으로 답변드리겠습니다.`
+          )
+          .setFooter({ text: 'Turn • 이 DM에 메시지를 보내면 스탭에게 전달됩니다' })
+          .setTimestamp();
+
+        await member.user.send({ embeds: [dmEmbed] });
+      } catch {
+        await ticketChannel.send({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xef4444)
+              .setDescription(`⚠️ **${member.user.tag}** 님의 DM이 차단되어 있어 메시지를 전송할 수 없습니다.`),
+          ],
+        });
+      }
+
+      logAction(guild, '🎫 티켓 생성', null, 0x22c55e, [
+        { name: '유형', value: option.label, inline: true },
+        { name: '생성자', value: member.user.tag, inline: true },
+        { name: '채널', value: `${ticketChannel}`, inline: true },
+        { name: '티켓 번호', value: `#${ticketNum}`, inline: true },
+      ]);
 
       return interaction.editReply({
-        content: `❌ 이미 진행중인 문의가 있습니다.${existingCh ? ` (${existingCh})` : ''}`,
+        content: '✅ 문의가 접수되었습니다! DM을 확인해주세요 🩷',
       });
-    }
-
-    ticketCounter++;
-    const ticketId = uuidv4();
-
-    try {
-      await getDb().collection('meta').doc('counter').set({ value: ticketCounter });
     } catch (e) {
-      console.error('카운터 저장 실패:', e);
+      console.error('티켓 생성 중 오류:', e);
+      return interaction.editReply({ content: '❌ 티켓 생성 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.' });
+    } finally {
+      creatingSet.delete(member.id);
     }
-
-    const safeName =
-      member.user.username
-        .toLowerCase()
-        .replace(/[^a-z0-9가-힣]/g, '')
-        .slice(0, 12) || 'user';
-
-    const channelName = `${option.channelPrefix || option.value.toLowerCase()}-${safeName}`;
-    const ticketNum = String(ticketCounter).padStart(4, '0');
-
-    const STAFF_ALLOW = [
-      PermissionsBitField.Flags.ViewChannel,
-      PermissionsBitField.Flags.SendMessages,
-      PermissionsBitField.Flags.ReadMessageHistory,
-      PermissionsBitField.Flags.AttachFiles,
-      PermissionsBitField.Flags.ManageMessages,
-    ];
-
-    const configuredStaff = validStaffRoleIds();
-    const staffIds = configuredStaff.filter(id => guild.roles.cache.has(id));
-    const missingStaff = configuredStaff.filter(id => !guild.roles.cache.has(id));
-    const everyoneMode = staffEveryoneMode();
-    if (missingStaff.length) {
-      console.warn(`⚠️ 고객센터 서버(${guild.name})에 없는 역할 ID 무시: ${missingStaff.join(', ')}`);
-    }
-    if (!everyoneMode && staffIds.length === 0) {
-      console.warn('⚠️ 유효한 스탭 설정이 없습니다. STAFF_ROLE_ID에 고객센터 서버 역할 ID를 넣거나 "everyone"으로 설정하세요.');
-    }
-
-    // everyoneMode면 @everyone 에게 열어주고, 아니면 막고 스탭 역할에만 허용
-    const everyoneOverwrite = everyoneMode
-      ? { id: guild.roles.everyone.id, allow: STAFF_ALLOW }
-      : { id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] };
-
-    const permissionOverwrites = [
-      everyoneOverwrite,
-      ...staffIds.map(id => ({ id, allow: STAFF_ALLOW })),
-      {
-        id: client.user.id,
-        allow: [
-          PermissionsBitField.Flags.ViewChannel,
-          PermissionsBitField.Flags.SendMessages,
-          PermissionsBitField.Flags.ReadMessageHistory,
-        ],
-      },
-    ];
-
-    const ticketChannel = await guild.channels.create({
-      name: channelName,
-      type: ChannelType.GuildText,
-      parent: categoryId,
-      topic: `ticketId:${ticketId} | userId:${member.id} | type:${option.value}`,
-      permissionOverwrites,
-    });
-
-    dmMap.set(member.id, {
-      ticketId,
-      channelId: ticketChannel.id,
-      type: option.value,
-      typeLabel: option.label,
-    });
-
-    const ticketData = {
-      ticketId,
-      ticketNumber: ticketCounter,
-      channelId: ticketChannel.id,
-      channelName,
-      type: option.value,
-      typeLabel: option.label,
-      userId: member.id,
-      userTag: member.user.tag,
-      userDisplayName: member.displayName,
-      guildId: guild.id,
-      guildName: guild.name,
-      status: 'open',
-      createdAt: new Date().toISOString(),
-      closedAt: null,
-      closedBy: null,
-      messages: [],
-    };
-
-    try {
-      await getDb().collection('tickets').doc(ticketId).set(ticketData);
-    } catch (e) {
-      console.error('티켓 생성 Firestore 저장 실패:', e);
-    }
-
-    await sendStaffGuide(ticketChannel, member, option, ticketNum, ticketId);
-
-    try {
-      const dmEmbed = new EmbedBuilder()
-        .setColor(0x7c3aed)
-        .setTitle(`${option.emoji ? option.emoji + ' ' : ''}${option.label} 문의 접수`)
-        .setDescription(
-          `안녕하세요 **${member.displayName}**님!\n\n` +
-          `**[${option.label}]** 문의가 접수되었습니다 🩷\n\n` +
-          `아래에 문의하실 내용을 입력해주세요.\n` +
-          `스탭이 확인 후 이 DM으로 답변드리겠습니다.`
-        )
-        .setFooter({ text: 'Turn • 이 DM에 메시지를 보내면 스탭에게 전달됩니다' })
-        .setTimestamp();
-
-      await member.user.send({ embeds: [dmEmbed] });
-    } catch {
-      await ticketChannel.send({
-        embeds: [
-          new EmbedBuilder()
-            .setColor(0xef4444)
-            .setDescription(`⚠️ **${member.user.tag}** 님의 DM이 차단되어 있어 메시지를 전송할 수 없습니다.`),
-        ],
-      });
-    }
-
-    logAction(guild, '🎫 티켓 생성', null, 0x22c55e, [
-      { name: '유형', value: option.label, inline: true },
-      { name: '생성자', value: member.user.tag, inline: true },
-      { name: '채널', value: `${ticketChannel}`, inline: true },
-      { name: '티켓 번호', value: `#${ticketNum}`, inline: true },
-    ]);
-
-    return interaction.editReply({
-      content: '✅ 문의가 접수되었습니다! DM을 확인해주세요 🩷',
-    });
   }
 });
 
@@ -477,7 +608,7 @@ async function sendStaffGuide(ticketChannel, member, option, ticketNum, ticketId
     .setColor(0x7c3aed)
     .setTitle(`${option.emoji ? option.emoji + ' ' : ''}${option.label} 티켓 #${ticketNum}`)
     .setDescription(
-      `<@&${config.STAFF_ROLE_ID}> 새 문의가 접수되었습니다.\n\n` +
+      `${staffMention()} 새 문의가 접수되었습니다.\n\n` +
       `> 이 채널에서 답변을 입력하면 유저의 DM으로 자동 전달됩니다.`
     )
     .addFields(
@@ -496,6 +627,14 @@ async function sendStaffGuide(ticketChannel, member, option, ticketNum, ticketId
 // 메시지 핸들러
 // ─────────────────────────────────────────────
 client.on('messageCreate', async (message) => {
+  // partial(캐시 안 된 DM/메시지)이면 먼저 풀어줌 — DM/첨부 제대로 받으려면 필수
+  if (message.partial) {
+    try { await message.fetch(); } catch { return; }
+  }
+  if (message.channel?.partial) {
+    try { await message.channel.fetch(); } catch {}
+  }
+
   if (message.author.bot) return;
 
   // ── DM: 유저 → 스탭 채널 릴레이 ──
@@ -526,14 +665,30 @@ client.on('messageCreate', async (message) => {
     if (!guild) return;
 
     const ticketChannel = guild.channels.cache.get(ticketInfo.channelId);
-    if (!ticketChannel) return;
+    if (!ticketChannel) {
+      // 채널이 사라진 매핑 정리 + 유저 안내
+      dmMap.delete(message.author.id);
+      return message.reply({
+        embeds: [
+          new EmbedBuilder()
+            .setColor(0xef4444)
+            .setDescription('❌ 문의 채널이 종료되었습니다. 새로 문의하시려면 서버에서 티켓을 다시 생성해주세요.'),
+        ],
+      });
+    }
 
-    const files = message.attachments.map(a => a.url);
+    const files = [...message.attachments.values()].map(a => a.url);
     const lines = (message.content || '').split('\n').map(line =>
       `<@${message.author.id}>(${message.author.id}) : ${line}`
     ).join('\n');
-    await ticketChannel.send({ content: lines || undefined, files });
-    await message.react('✅').catch(() => {});
+
+    try {
+      await sendChunked(ticketChannel, lines, files);
+      await message.react('✅').catch(() => {});
+    } catch (e) {
+      console.error('스탭 채널 릴레이 실패:', e.message);
+      await message.react('⚠️').catch(() => {});
+    }
 
     try {
       const db = getDb();
@@ -585,11 +740,6 @@ client.on('messageCreate', async (message) => {
       if (ticketId) {
         await closeTicket(channel, ticketId, message.member, null, message);
       }
-      return;
-    }
-
-    // ! 내부 메시지
-    if (content.startsWith('!')) {
       return;
     }
 
@@ -713,23 +863,31 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
+    // ! 내부 메시지 (유저에게 전달 안 함)
+    if (content.startsWith('!')) {
+      return;
+    }
+
+    // 알 수 없는 .명령어는 유저에게 릴레이하지 않음 (오발송 방지)
+    if (content.startsWith('.') && !KNOWN_DOT_COMMANDS.some(c => content.startsWith(c))) {
+      await message.react('❓').catch(() => {});
+      return;
+    }
+
     // 일반 스탭 답변
     if (!userId) return;
 
     try {
       const user = await client.users.fetch(userId);
-      const fileAttachments = message.attachments.map(
+      const fileAttachments = [...message.attachments.values()].map(
         a => new AttachmentBuilder(a.url, { name: a.name })
       );
 
       const staffLines = (message.content || '').split('\n').map(line =>
         `[관리자] ${message.member.displayName}: ${line}`
       ).join('\n');
-      await user.send({
-        content: staffLines || undefined,
-        files: fileAttachments.length > 0 ? fileAttachments : [],
-      });
 
+      await sendChunked(user, staffLines, fileAttachments);
       await message.react('📨').catch(() => {});
 
       if (ticketId) {
@@ -745,7 +903,7 @@ client.on('messageCreate', async (message) => {
               authorTag: message.author.tag,
               authorAvatar: message.author.displayAvatarURL({ size: 64 }),
               content: message.content || '',
-              attachments: message.attachments.map(a => a.url),
+              attachments: [...message.attachments.values()].map(a => a.url),
               isBot: false,
               from: 'staff',
               timestamp: new Date().toISOString(),
@@ -770,72 +928,79 @@ async function closeTicket(channel, ticketId, member, interaction = null, messag
   if (closingSet.has(ticketId)) return;
   closingSet.add(ticketId);
 
-  // 1. 채널에 종료 메시지
-  const closingEmbed = new EmbedBuilder()
-    .setColor(0xef4444)
-    .setTitle('🔒 티켓 종료 중')
-    .setDescription(`**${member.user.tag}** 님이 티켓을 종료합니다.\n5초 후 채널이 삭제됩니다.`)
-    .setTimestamp();
   try {
-    if (interaction) await interaction.reply({ embeds: [closingEmbed] });
-    else await channel.send({ embeds: [closingEmbed] });
-  } catch {}
-
-  // 2. Firestore 업데이트
-  const logUrl = `${config.WEB_BASE_URL}ticket/${ticketId}`;
-  try {
-    await getDb().collection('tickets').doc(ticketId).update({
-      status: 'closed',
-      closedAt: new Date().toISOString(),
-      closedBy: member.user.tag,
-      closedById: member.id,
-      logUrl,
-    });
-  } catch (e) { console.error('티켓 종료 저장 실패:', e); }
-
-  // 3. dmMap에서 제거
-  const userId = channel.topic?.match(/userId:(\d+)/)?.[1];
-  if (userId) dmMap.delete(userId);
-
-  // 4. 고객 DM 전송
-  if (userId) {
+    // 1. 채널에 종료 메시지
+    const closingEmbed = new EmbedBuilder()
+      .setColor(0xef4444)
+      .setTitle('🔒 티켓 종료 중')
+      .setDescription(`**${member.user.tag}** 님이 티켓을 종료합니다.\n5초 후 채널이 삭제됩니다.`)
+      .setTimestamp();
     try {
-      const user = await client.users.fetch(userId);
-      await user.send({ embeds: [new EmbedBuilder()
-        .setColor(0x7c3aed)
-        .setTitle('✅ 문의 종료')
-        .setDescription('문의가 종료되었습니다.\n이용해주셔서 감사합니다 🩷')
-        .setFooter({ text: 'Turn' })
-        .setTimestamp()] });
-    } catch (e) { console.error('유저 DM 전송 실패:', e.message); }
-  }
-
-  // 5. 로그 채널 전송
-  const guild = channel.guild;
-  const logChannel = guild.channels.cache.get(config.LOG_CHANNEL_ID);
-  if (logChannel) {
-    try {
-      await logChannel.send({ embeds: [new EmbedBuilder()
-        .setColor(0xef4444)
-        .setTitle('🔒 티켓 종료 — 로그 저장됨')
-        .addFields(
-          { name: '📋 채널', value: channel.name, inline: true },
-          { name: '👤 닫은 사람', value: member.user.tag, inline: true },
-          { name: '🔗 로그 링크', value: logUrl, inline: false },
-        )
-        .setFooter({ text: 'Turn' })
-        .setTimestamp()] });
+      if (interaction) await interaction.reply({ embeds: [closingEmbed] });
+      else await channel.send({ embeds: [closingEmbed] });
     } catch {}
+
+    // 2. Firestore 업데이트
+    const logUrl = `${config.WEB_BASE_URL}ticket/${ticketId}`;
+    try {
+      await getDb().collection('tickets').doc(ticketId).update({
+        status: 'closed',
+        closedAt: new Date().toISOString(),
+        closedBy: member.user.tag,
+        closedById: member.id,
+        logUrl,
+      });
+    } catch (e) { console.error('티켓 종료 저장 실패:', e); }
+
+    // 3. dmMap에서 제거
+    const userId = channel.topic?.match(/userId:(\d+)/)?.[1];
+    if (userId) dmMap.delete(userId);
+
+    // 4. 고객 DM 전송
+    if (userId) {
+      try {
+        const user = await client.users.fetch(userId);
+        await user.send({ embeds: [new EmbedBuilder()
+          .setColor(0x7c3aed)
+          .setTitle('✅ 문의 종료')
+          .setDescription('문의가 종료되었습니다.\n이용해주셔서 감사합니다 🩷')
+          .setFooter({ text: 'Turn' })
+          .setTimestamp()] });
+      } catch (e) { console.error('유저 DM 전송 실패:', e.message); }
+    }
+
+    // 5. 로그 채널 전송
+    const guild = channel.guild;
+    const logChannel = guild.channels.cache.get(config.LOG_CHANNEL_ID);
+    if (logChannel) {
+      try {
+        await logChannel.send({ embeds: [new EmbedBuilder()
+          .setColor(0xef4444)
+          .setTitle('🔒 티켓 종료 — 로그 저장됨')
+          .addFields(
+            { name: '📋 채널', value: channel.name, inline: true },
+            { name: '👤 닫은 사람', value: member.user.tag, inline: true },
+            { name: '🔗 로그 링크', value: logUrl, inline: false },
+          )
+          .setFooter({ text: 'Turn' })
+          .setTimestamp()] });
+      } catch {}
+    }
+
+    logAction(guild, `🔒 티켓 닫힘`, null, 0xef4444, [
+      { name: '채널', value: channel.name, inline: true },
+      { name: '닫은 사람', value: member.user.tag, inline: true },
+      { name: '로그', value: logUrl, inline: false },
+    ]);
+
+    // 6. 5초 후 채널 삭제 + closingSet 정리
+    setTimeout(() => {
+      channel.delete().catch(() => {}).finally(() => closingSet.delete(ticketId));
+    }, 5000);
+  } catch (e) {
+    console.error('티켓 종료 처리 오류:', e);
+    closingSet.delete(ticketId);
   }
-
-  logAction(guild, `🔒 티켓 닫힘`, null, 0xef4444, [
-    { name: '채널', value: channel.name, inline: true },
-    { name: '닫은 사람', value: member.user.tag, inline: true },
-    { name: '로그', value: logUrl, inline: false },
-  ]);
-
-  // 6. 5초 후 채널 삭제
-  setTimeout(() => channel.delete().catch(() => {}), 5000);
 }
 
 async function logAction(guild, title, description, color, fields = []) {
@@ -859,5 +1024,13 @@ async function logAction(guild, title, description, color, fields = []) {
 
   logChannel.send({ embeds: [embed] }).catch(() => {});
 }
+
+// 처리되지 않은 예외로 봇이 죽지 않게
+process.on('unhandledRejection', (reason) => {
+  console.error('unhandledRejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('uncaughtException:', err);
+});
 
 client.login(config.TOKEN);
