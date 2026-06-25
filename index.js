@@ -111,6 +111,19 @@ async function sendChunked(target, content, files = []) {
   }
 }
 
+// 릴레이용 임베드 생성 (메시지 1개 = 임베드 1개, 줄별 프리픽스 X)
+// 본문이 4096자 넘으면 여러 임베드로 자동 분할, 헤더는 첫 임베드에만.
+function buildRelayEmbeds(content, { color, authorName, authorIcon }) {
+  const text = (content || '').trim();
+  const chunks = text ? chunkContent(text, 4000) : ['*(첨부파일)*'];
+  return chunks.slice(0, 10).map((chunk, i, arr) => {
+    const e = new EmbedBuilder().setColor(color).setDescription(chunk);
+    if (i === 0) e.setAuthor({ name: authorName, iconURL: authorIcon });
+    if (i === arr.length - 1) e.setTimestamp();
+    return e;
+  });
+}
+
 async function getSetting(key) {
   try {
     const doc = await getDb().collection('settings').doc(key).get();
@@ -678,12 +691,15 @@ client.on('messageCreate', async (message) => {
     }
 
     const files = [...message.attachments.values()].map(a => a.url);
-    const lines = (message.content || '').split('\n').map(line =>
-      `<@${message.author.id}>(${message.author.id}) : ${line}`
-    ).join('\n');
+    const authorName = `${message.author.globalName || message.author.username} (${message.author.id})`;
+    const relayEmbeds = buildRelayEmbeds(message.content, {
+      color: 0x5865f2,
+      authorName,
+      authorIcon: message.author.displayAvatarURL({ size: 64 }),
+    });
 
     try {
-      await sendChunked(ticketChannel, lines, files);
+      await ticketChannel.send({ embeds: relayEmbeds, files });
       await message.react('✅').catch(() => {});
     } catch (e) {
       console.error('스탭 채널 릴레이 실패:', e.message);
@@ -883,11 +899,13 @@ client.on('messageCreate', async (message) => {
         a => new AttachmentBuilder(a.url, { name: a.name })
       );
 
-      const staffLines = (message.content || '').split('\n').map(line =>
-        `[관리자] ${message.member.displayName}: ${line}`
-      ).join('\n');
+      const replyEmbeds = buildRelayEmbeds(message.content, {
+        color: 0x7c3aed,
+        authorName: `${message.member.displayName} · Turn 고객센터`,
+        authorIcon: client.user.displayAvatarURL(),
+      });
 
-      await sendChunked(user, staffLines, fileAttachments);
+      await user.send({ embeds: replyEmbeds, files: fileAttachments });
       await message.react('📨').catch(() => {});
 
       if (ticketId) {
